@@ -1,309 +1,227 @@
 import os
-import json
-import time
 import sqlite3
-import logging
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Dict, Any
-
-from telegram import Update, ReplyKeyboardMarkup
+import asyncio
+from aiohttp import web
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
-    Updater,
+    Application,
     CommandHandler,
     MessageHandler,
-    Filters,
-    CallbackContext,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
 
-# ================= CONFIG =================
+# =======================
+# ENV
+# =======================
+TOKEN = os.getenv("TG_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+PORT = int(os.getenv("PORT", "8000"))
 
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "PASTE_TOKEN_HERE"
-OWNER_ID = 8468189353
-DAILY_LIMIT_USER = 10
-DB_FILE = "bot.db"
+# =======================
+# DATABASE
+# =======================
+db = sqlite3.connect("bot.db", check_same_thread=False)
+cur = db.cursor()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    status TEXT DEFAULT 'active'
 )
+""")
 
-# ================= HEALTH SERVER (KOYEB FIX) =================
+cur.execute("""
+CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    file_id TEXT,
+    file_type TEXT
+)
+""")
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+db.commit()
 
-def run_health_server():
-    server = HTTPServer(("0.0.0.0", 8000), HealthHandler)
-    server.serve_forever()
+# =======================
+# SECURITY
+# =======================
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
 
-# ================= DATABASE =================
+# =======================
+# START / PROFILE
+# =======================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
 
-def db():
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
-
-def init_db():
-    con = db()
-    cur = con.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        role TEXT DEFAULT 'user',
-        created_at INTEGER
+    cur.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
+        (user.id, user.username, user.first_name),
     )
-    """)
+    db.commit()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS requests (
-        user_id INTEGER,
-        date TEXT,
-        count INTEGER,
-        PRIMARY KEY (user_id, date)
+    keyboard = [
+        [InlineKeyboardButton("👤 Профіль", callback_data="profile")],
+        [InlineKeyboardButton("🕵️ OSINT", callback_data="osint")],
+    ]
+
+    await update.message.reply_text(
+        "🔐 Бот активний.\nВибери дію:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS stored_entities (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT,
-        value TEXT,
-        raw_data TEXT,
-        hits INTEGER DEFAULT 1,
-        first_seen INTEGER,
-        last_seen INTEGER
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    cur.execute("SELECT status FROM users WHERE user_id=?", (query.from_user.id,))
+    status = cur.fetchone()[0]
+
+    await query.edit_message_text(
+        f"👤 Профіль\n\n"
+        f"ID: {query.from_user.id}\n"
+        f"Username: @{query.from_user.username}\n"
+        f"Статус: {status}"
     )
-    """)
 
-    con.commit()
-    con.close()
+# =======================
+# OSINT (BASE)
+# =======================
+async def osint_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-# ================= USERS / ROLES =================
+    keyboard = [
+        [InlineKeyboardButton("🔎 Username", callback_data="osint_username")],
+        [InlineKeyboardButton("📞 Телефон", callback_data="osint_phone")],
+    ]
 
-def get_user(user_id: int):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    con.close()
-    return row[0] if row else None
+    await query.edit_message_text(
+        "🕵️ OSINT-методи:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-def ensure_user(user_id: int):
-    if not get_user(user_id):
-        con = db()
-        cur = con.cursor()
-        role = "owner" if user_id == OWNER_ID else "user"
-        cur.execute(
-            "INSERT INTO users VALUES (?, ?, ?)",
-            (user_id, role, int(time.time()))
+async def osint_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text(
+        "Відправ username (без @)"
+    )
+    context.user_data["osint"] = "username"
+
+async def osint_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text(
+        "Відправ номер телефону"
+    )
+    context.user_data["osint"] = "phone"
+
+async def osint_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = context.user_data.get("osint")
+
+    if mode == "username":
+        await update.message.reply_text(
+            f"🔍 OSINT username:\n"
+            f"- Telegram\n"
+            f"- GitHub\n"
+            f"- Instagram\n\n"
+            f"Введено: {update.message.text}"
         )
-        con.commit()
-        con.close()
 
-# ================= LIMITS =================
-
-def check_limit(user_id: int) -> bool:
-    role = get_user(user_id)
-    if role in ("admin", "owner"):
-        return True
-
-    today = time.strftime("%Y-%m-%d")
-    con = db()
-    cur = con.cursor()
-
-    cur.execute(
-        "SELECT count FROM requests WHERE user_id=? AND date=?",
-        (user_id, today)
-    )
-    row = cur.fetchone()
-
-    if not row:
-        cur.execute(
-            "INSERT INTO requests VALUES (?, ?, ?)",
-            (user_id, today, 1)
+    elif mode == "phone":
+        await update.message.reply_text(
+            f"📞 OSINT phone:\n"
+            f"- Telegram\n"
+            f"- WhatsApp\n\n"
+            f"Введено: {update.message.text}"
         )
-        con.commit()
-        con.close()
-        return True
 
-    if row[0] >= DAILY_LIMIT_USER:
-        con.close()
-        return False
+    context.user_data["osint"] = None
 
-    cur.execute(
-        "UPDATE requests SET count=count+1 WHERE user_id=? AND date=?",
-        (user_id, today)
-    )
-    con.commit()
-    con.close()
-    return True
+# =======================
+# FILE SAVE (NO DELETE)
+# =======================
+async def save_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
 
-# ================= OSINT CORE =================
-
-def detect_type(text: str) -> str:
-    if "@" in text and "." in text:
-        return "email"
-    if text.replace("+", "").isdigit():
-        return "phone"
-    if len(text) >= 3:
-        return "username"
-    return "unknown"
-
-def search_local_db(entity_type: str, value: str) -> Dict[str, Any]:
-    con = db()
-    cur = con.cursor()
-    cur.execute(
-        "SELECT hits, raw_data, first_seen, last_seen FROM stored_entities WHERE type=? AND value=?",
-        (entity_type, value)
-    )
-    row = cur.fetchone()
-    con.close()
-
-    if not row:
-        return {"found": False}
-
-    return {
-        "found": True,
-        "hits": row[0],
-        "data": json.loads(row[1]),
-        "first_seen": row[2],
-        "last_seen": row[3],
-    }
-
-def save_entity(entity_type: str, value: str, data: Dict[str, Any]):
-    now = int(time.time())
-    con = db()
-    cur = con.cursor()
-
-    cur.execute(
-        "SELECT id FROM stored_entities WHERE type=? AND value=?",
-        (entity_type, value)
-    )
-    row = cur.fetchone()
-
-    if row:
-        cur.execute("""
-        UPDATE stored_entities
-        SET hits=hits+1, last_seen=?, raw_data=?
-        WHERE id=?
-        """, (now, json.dumps(data), row[0]))
+    if update.message.document:
+        file_id = update.message.document.file_id
+        file_type = "document"
+    elif update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        file_type = "photo"
     else:
-        cur.execute("""
-        INSERT INTO stored_entities
-        (type, value, raw_data, first_seen, last_seen)
-        VALUES (?, ?, ?, ?, ?)
-        """, (entity_type, value, json.dumps(data), now, now))
-
-    con.commit()
-    con.close()
-
-# ================= AI SIMULATION =================
-
-def ai_analyze(text: str) -> Dict[str, Any]:
-    return {
-        "intent": "osint",
-        "type": detect_type(text),
-        "query": text
-    }
-
-# ================= BOT HANDLERS =================
-
-def start(update: Update, context: CallbackContext):
-    ensure_user(update.effective_user.id)
-
-    kb = ReplyKeyboardMarkup(
-        [["🤖 AI", "📊 Статус"]],
-        resize_keyboard=True
-    )
-
-    update.message.reply_text(
-        "🤖 AI-OSINT бот\n\nНапиши будь-який запит:",
-        reply_markup=kb
-    )
-
-def status(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    role = get_user(user_id)
-
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    users = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM stored_entities")
-    entities = cur.fetchone()[0]
-    con.close()
-
-    update.message.reply_text(
-        f"📊 Статус\n\n"
-        f"👤 Роль: {role}\n"
-        f"👥 Користувачів: {users}\n"
-        f"🗃 Записів у БД: {entities}"
-    )
-
-def handle_text(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    ensure_user(user_id)
-
-    text = update.message.text.strip()
-
-    if text == "📊 Статус":
-        return status(update, context)
-
-    if not check_limit(user_id):
-        update.message.reply_text("⛔ Ліміт запитів вичерпано")
         return
 
-    ai = ai_analyze(text)
+    cur.execute(
+        "INSERT INTO files (user_id, file_id, file_type) VALUES (?, ?, ?)",
+        (user_id, file_id, file_type)
+    )
+    db.commit()
 
-    entity_type = ai["type"]
-    value = ai["query"]
+    await update.message.reply_text("📁 Файл збережено в БД")
 
-    local = search_local_db(entity_type, value)
+# =======================
+# OWNER PANEL
+# =======================
+async def owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
 
-    result_data = {
-        "type": entity_type,
-        "value": value,
-        "timestamp": int(time.time())
-    }
+    cur.execute("SELECT COUNT(*) FROM users")
+    users = cur.fetchone()[0]
 
-    if local["found"]:
-        result_data["history_hits"] = local["hits"]
-        result_data["note"] = "Знайдено у базі"
-    else:
-        result_data["note"] = "Новий запис"
+    cur.execute("SELECT COUNT(*) FROM files")
+    files = cur.fetchone()[0]
 
-    save_entity(entity_type, value, result_data)
-
-    reply = (
-        f"🔎 Тип: {entity_type}\n"
-        f"📌 Значення: {value}\n\n"
-        f"🗃 {result_data['note']}\n"
+    await update.message.reply_text(
+        f"👑 Панель власника\n\n"
+        f"Користувачів: {users}\n"
+        f"Файлів: {files}"
     )
 
-    if local["found"]:
-        reply += f"🔁 Запитів раніше: {local['hits']}\n"
+# =======================
+# HTTP SERVER (KOYEB)
+# =======================
+async def health(request):
+    return web.Response(text="OK")
 
-    update.message.reply_text(reply)
+async def run_web():
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
 
-# ================= RUN =================
+# =======================
+# MAIN
+# =======================
+async def main():
+    application = Application.builder().token(TOKEN).build()
 
-def main():
-    init_db()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("owner", owner))
+    application.add_handler(CallbackQueryHandler(profile, pattern="profile"))
+    application.add_handler(CallbackQueryHandler(osint_menu, pattern="osint"))
+    application.add_handler(CallbackQueryHandler(osint_username, pattern="osint_username"))
+    application.add_handler(CallbackQueryHandler(osint_phone, pattern="osint_phone"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, osint_handler))
+    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, save_files))
 
-    # 🔥 запускаємо health-server для Koyeb
-    threading.Thread(target=run_health_server, daemon=True).start()
+    await application.initialize()
+    await application.start()
+    await application.bot.initialize()
 
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
+    await run_web()
 
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
-
-    updater.start_polling()
-    updater.idle()
+    await application.stop()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

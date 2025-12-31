@@ -26,6 +26,7 @@ def db():
 
 def init_db():
     c = db().cursor()
+
     c.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -52,6 +53,7 @@ def init_db():
         action TEXT,
         at TEXT
     )""")
+
     c.connection.commit()
     c.connection.close()
 
@@ -79,6 +81,7 @@ def log(uid, action):
 # ================== COMMANDS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+
     c = db().cursor()
     c.execute("""
         INSERT OR IGNORE INTO users
@@ -86,6 +89,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """, (u.id, u.username, u.first_name, datetime.utcnow().isoformat(), "start"))
     c.connection.commit()
     c.connection.close()
+
     log(u.id, "start")
 
     await update.message.reply_text(
@@ -155,7 +159,7 @@ async def osint(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).fetchone()
     else:
         res = c.execute(
-            "SELECT * FROM users WHERE username LIKE ?",
+            "SELECT * FROM users WHERE username=?",
             (q.replace("@", ""),)
         ).fetchone()
 
@@ -195,24 +199,23 @@ async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ))
     c.connection.commit()
     c.connection.close()
-    log(u.id, "file_saved")
 
+    log(u.id, "file_saved")
     await m.reply_text("📁 Файл збережено")
 
 # ================== MAIN ==================
 async def main():
     init_db()
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("osint", osint))
-
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, save_file))
 
-    await app.start()
-    await asyncio.Event().wait()
+    await app.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())

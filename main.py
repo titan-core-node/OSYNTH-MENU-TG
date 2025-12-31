@@ -1,10 +1,9 @@
 import os
-import asyncio
-import logging
 import time
-import aiosqlite
-
-from aiohttp import web
+import asyncio
+import sqlite3
+import psutil
+from datetime import datetime
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -14,200 +13,205 @@ from telegram.ext import (
     filters,
 )
 
-# ================= CONFIG =================
+# ================== CONFIG ==================
+TOKEN = os.getenv("TG_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID"))
+DB_NAME = "database.db"
+START_TIME = time.time()
+USER_COOLDOWN = {}
 
-BOT_TOKEN = os.getenv("TG_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-PORT = int(os.getenv("PORT", "8000"))
+# ================== DATABASE ==================
+def db():
+    return sqlite3.connect(DB_NAME)
 
-DB_FILE = "osynth.db"
+def init_db():
+    c = db().cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        joined_at TEXT,
+        last_action TEXT
+    )""")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        file_id TEXT,
+        file_name TEXT,
+        file_type TEXT,
+        saved_at TEXT
+    )""")
 
-# ================= DATABASE =================
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        action TEXT,
+        at TEXT
+    )""")
+    c.connection.commit()
+    c.connection.close()
 
-async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            role TEXT,
-            created_at INTEGER
-        )
-        """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS osint (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            entity_type TEXT,
-            value TEXT,
-            created_at INTEGER
-        )
-        """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            file_id TEXT,
-            file_type TEXT,
-            created_at INTEGER
-        )
-        """)
-        await db.commit()
+# ================== SECURITY ==================
+def is_owner(uid: int):
+    return uid == OWNER_ID
 
-async def ensure_user(user_id: int):
-    async with aiosqlite.connect(DB_FILE) as db:
-        cur = await db.execute(
-            "SELECT role FROM users WHERE user_id=?",
-            (user_id,),
-        )
-        row = await cur.fetchone()
-        if not row:
-            role = "owner" if user_id == OWNER_ID else "user"
-            await db.execute(
-                "INSERT INTO users VALUES (?, ?, ?)",
-                (user_id, role, int(time.time())),
-            )
-            await db.commit()
+def anti_spam(uid: int, seconds=2):
+    now = time.time()
+    last = USER_COOLDOWN.get(uid, 0)
+    if now - last < seconds:
+        return False
+    USER_COOLDOWN[uid] = now
+    return True
 
-async def get_role(user_id: int) -> str:
-    async with aiosqlite.connect(DB_FILE) as db:
-        cur = await db.execute(
-            "SELECT role FROM users WHERE user_id=?",
-            (user_id,),
-        )
-        row = await cur.fetchone()
-        return row[0] if row else "user"
+def log(uid, action):
+    c = db().cursor()
+    c.execute(
+        "INSERT INTO logs (user_id, action, at) VALUES (?, ?, ?)",
+        (uid, action, datetime.utcnow().isoformat())
+    )
+    c.connection.commit()
+    c.connection.close()
 
-# ================= OSINT =================
-
-def detect_entity(text: str) -> str:
-    if "@" in text and "." in text:
-        return "email"
-    if text.replace("+", "").isdigit():
-        return "phone"
-    if len(text) >= 3:
-        return "username"
-    return "unknown"
-
-async def save_osint(user_id: int, entity: str, value: str):
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT INTO osint (user_id, entity_type, value, created_at) VALUES (?, ?, ?, ?)",
-            (user_id, entity, value, int(time.time())),
-        )
-        await db.commit()
-
-# ================= BOT HANDLERS =================
-
+# ================== COMMANDS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await ensure_user(user_id)
+    u = update.effective_user
+    c = db().cursor()
+    c.execute("""
+        INSERT OR IGNORE INTO users
+        VALUES (?, ?, ?, ?, ?)
+    """, (u.id, u.username, u.first_name, datetime.utcnow().isoformat(), "start"))
+    c.connection.commit()
+    c.connection.close()
+    log(u.id, "start")
+
     await update.message.reply_text(
-        "🤖 OSYNTH OSINT BOT\n\n"
-        "• Надішли текст — OSINT\n"
-        "• Надішли файл — він збережеться\n"
-        "• /profile — профіль\n"
-        "• /status — статус"
+        "🦭 *Меню тюленя 5.0*\n\n"
+        "🔐 Безпека: активна\n"
+        "🕵️ OSINT: доступний\n"
+        "📊 /status — стан системи\n"
+        "👤 /profile — профіль",
+        parse_mode="Markdown"
     )
 
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    role = await get_role(user_id)
-    await update.message.reply_text(
-        f"👤 PROFILE\n\nID: {user_id}\nROLE: {role}"
-    )
-
+# ================== STATUS ==================
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with aiosqlite.connect(DB_FILE) as db:
-        users = await (await db.execute("SELECT COUNT(*) FROM users")).fetchone()
-        osint = await (await db.execute("SELECT COUNT(*) FROM osint")).fetchone()
-        files = await (await db.execute("SELECT COUNT(*) FROM files")).fetchone()
+    cpu = psutil.cpu_percent()
+    ram = psutil.virtual_memory().percent
+    uptime = int(time.time() - START_TIME)
+
+    c = db().cursor()
+    users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    files = c.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    c.connection.close()
 
     await update.message.reply_text(
-        "📊 STATUS\n\n"
-        f"Users: {users[0]}\n"
-        f"OSINT: {osint[0]}\n"
-        f"Files: {files[0]}"
+        f"📊 *Статус бота*\n\n"
+        f"⏱ Uptime: {uptime}s\n"
+        f"🧠 CPU: {cpu}%\n"
+        f"💾 RAM: {ram}%\n"
+        f"👥 Users: {users}\n"
+        f"📁 Files: {files}",
+        parse_mode="Markdown"
     )
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await ensure_user(user_id)
+# ================== PROFILE ==================
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    role = "OWNER" if is_owner(u.id) else "USER"
 
-    text = update.message.text.strip()
-    entity = detect_entity(text)
-    await save_osint(user_id, entity, text)
+    c = db().cursor()
+    joined = c.execute(
+        "SELECT joined_at FROM users WHERE user_id=?",
+        (u.id,)
+    ).fetchone()
+    c.connection.close()
 
     await update.message.reply_text(
-        f"🔎 OSINT\nType: {entity}\nValue: {text}\nSaved ✅"
+        f"👤 *Профіль*\n\n"
+        f"ID: `{u.id}`\n"
+        f"Username: @{u.username}\n"
+        f"Role: {role}\n"
+        f"Joined: {joined[0] if joined else '—'}",
+        parse_mode="Markdown"
     )
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await ensure_user(user_id)
+# ================== OSINT ==================
+async def osint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❗ /osint <username|id>")
+        return
 
-    file = None
-    ftype = "unknown"
+    q = context.args[0]
+    c = db().cursor()
 
-    if update.message.document:
-        file = update.message.document
-        ftype = "document"
-    elif update.message.photo:
-        file = update.message.photo[-1]
-        ftype = "photo"
+    if q.isdigit():
+        res = c.execute(
+            "SELECT * FROM users WHERE user_id=?",
+            (int(q),)
+        ).fetchone()
+    else:
+        res = c.execute(
+            "SELECT * FROM users WHERE username LIKE ?",
+            (q.replace("@", ""),)
+        ).fetchone()
 
+    c.connection.close()
+
+    if not res:
+        await update.message.reply_text("❌ Нічого не знайдено")
+        return
+
+    await update.message.reply_text(
+        f"🕵️ *OSINT RESULT*\n\n"
+        f"ID: {res[0]}\n"
+        f"Username: @{res[1]}\n"
+        f"Name: {res[2]}\n"
+        f"Joined: {res[3]}",
+        parse_mode="Markdown"
+    )
+
+# ================== FILE SAVE ==================
+async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    m = update.message
+    file = m.document or (m.photo[-1] if m.photo else None)
     if not file:
         return
 
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT INTO files (user_id, file_id, file_type, created_at) VALUES (?, ?, ?, ?)",
-            (user_id, file.file_id, ftype, int(time.time())),
-        )
-        await db.commit()
+    c = db().cursor()
+    c.execute("""
+        INSERT INTO files (user_id, file_id, file_name, file_type, saved_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        u.id,
+        file.file_id,
+        getattr(file, "file_name", "photo"),
+        "file",
+        datetime.utcnow().isoformat()
+    ))
+    c.connection.commit()
+    c.connection.close()
+    log(u.id, "file_saved")
 
-    await update.message.reply_text("📁 File saved (not deleted)")
+    await m.reply_text("📁 Файл збережено")
 
-# ================= KOYEB HEALTH =================
-
-async def health(request):
-    return web.Response(text="OK")
-
-async def start_web():
-    app = web.Application()
-    app.router.add_get("/health", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
-# ================= MAIN =================
-
+# ================== MAIN ==================
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("TG_TOKEN is missing")
-
-    await init_db()
-    await start_web()
-
-    app = Application.builder().token(BOT_TOKEN).build()
+    init_db()
+    app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("osint", osint))
 
-    await app.initialize()
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, save_file))
+
     await app.start()
-    await app.bot.initialize()
-
-    logging.info("BOT STARTED")
-
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
